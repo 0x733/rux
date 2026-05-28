@@ -24,6 +24,15 @@ struct Args {
     /// Quiet mode (no progress bar)
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    #[arg(short = 's', long)]
+    max_speed: Option<String>,
+
+    #[arg(short = 'U', long)]
+    user_agent: Option<String>,
+
+    #[arg(short = 'c', long)]
+    resume: bool,
 }
 
 mod http_downloader;
@@ -48,10 +57,39 @@ async fn main() -> Result<()> {
     if args.input.starts_with("magnet:") || args.input.ends_with(".torrent") {
         torrent_downloader::download(&args.input, args.output, args.quiet).await?;
     } else if args.input.starts_with("http://") || args.input.starts_with("https://") {
-        http_downloader::download(&args.input, args.connections, args.output, args.quiet).await?;
+        let parsed_speed = args.max_speed.as_deref().and_then(parse_speed);
+        http_downloader::download(
+            &args.input,
+            args.connections,
+            args.output,
+            args.quiet,
+            parsed_speed,
+            args.user_agent,
+            args.resume,
+        ).await?;
     } else {
         anyhow::bail!("Unsupported input format. Please provide an HTTP/HTTPS URL, a Magnet link, or a path to a .torrent file.");
     }
 
     Ok(())
 }
+
+fn parse_speed(speed_str: &str) -> Option<u64> {
+    let speed_str = speed_str.trim().to_uppercase();
+    if speed_str.is_empty() {
+        return None;
+    }
+    let (num_str, unit) = if speed_str.ends_with("MB") {
+        (&speed_str[..speed_str.len() - 2], 1024 * 1024)
+    } else if speed_str.ends_with('M') {
+        (&speed_str[..speed_str.len() - 1], 1024 * 1024)
+    } else if speed_str.ends_with("KB") {
+        (&speed_str[..speed_str.len() - 2], 1024)
+    } else if speed_str.ends_with('K') {
+        (&speed_str[..speed_str.len() - 1], 1024)
+    } else {
+        (speed_str.as_str(), 1)
+    };
+    num_str.parse::<u64>().ok().map(|n| n * unit)
+}
+
