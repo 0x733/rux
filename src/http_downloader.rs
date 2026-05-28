@@ -17,6 +17,8 @@ unsafe extern "C" {
         max_speed: i64,
         user_agent: *const c_char,
         resume: bool,
+        headers: *const c_char,
+        proxy: *const c_char,
     ) -> i32;
 }
 
@@ -35,9 +37,12 @@ pub async fn download(
     max_speed: Option<u64>,
     user_agent: Option<String>,
     resume: bool,
-) -> Result<()> {
+    headers: Option<String>,
+    proxy: Option<String>,
+) -> Result<PathBuf> {
     let client = Client::new();
-    let res = client.head(url).send().await.context("Failed to send HEAD request")?;
+    let primary_url = url.split('\n').next().unwrap_or(url);
+    let res = client.head(primary_url).send().await.context("Failed to send HEAD request")?;
     let content_length = res
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
@@ -45,7 +50,7 @@ pub async fn download(
         .and_then(|s| s.parse::<u64>().ok());
 
     let mut file_name = output.unwrap_or_else(|| {
-        url.split('/')
+        primary_url.split('/')
             .last()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -53,7 +58,7 @@ pub async fn download(
     });
 
     if file_name.is_dir() {
-        let name = url.split('/')
+        let name = primary_url.split('/')
             .last()
             .filter(|s| !s.is_empty())
             .unwrap_or("downloaded_file");
@@ -101,11 +106,25 @@ pub async fn download(
     };
     let ua_ptr = ua_cstr.as_ref().map(|c| c.as_ptr() as usize).unwrap_or(0);
 
+    let headers_cstr = match headers {
+        Some(h) => Some(CString::new(h)?),
+        None => None,
+    };
+    let headers_ptr = headers_cstr.as_ref().map(|c| c.as_ptr() as usize).unwrap_or(0);
+
+    let proxy_cstr = match proxy {
+        Some(p) => Some(CString::new(p)?),
+        None => None,
+    };
+    let proxy_ptr = proxy_cstr.as_ref().map(|c| c.as_ptr() as usize).unwrap_or(0);
+
     let download_res = tokio::task::spawn_blocking(move || {
         let pb_ptr = pb_raw as *mut c_void;
         let url_raw = url_ptr as *const c_char;
         let path_raw = path_ptr as *const c_char;
         let ua_raw = ua_ptr as *const c_char;
+        let headers_raw = headers_ptr as *const c_char;
+        let proxy_raw = proxy_ptr as *const c_char;
         let ret = unsafe {
             download_http_cpp(
                 url_raw,
@@ -117,6 +136,8 @@ pub async fn download(
                 max_speed_i64,
                 ua_raw,
                 resume,
+                headers_raw,
+                proxy_raw,
             )
         };
         unsafe {
@@ -128,7 +149,7 @@ pub async fn download(
 
     if download_res == 0 {
         pb.finish_with_message("Download complete".bold().green().to_string());
-        Ok(())
+        Ok(file_name)
     } else {
         pb.abandon();
         anyhow::bail!("C++ download failed with error code: {}", download_res);

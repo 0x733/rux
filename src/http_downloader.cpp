@@ -31,6 +31,17 @@ struct FileDescriptorGuard {
     ~FileDescriptorGuard() { if (fd >= 0) close(fd); }
 };
 
+struct CurlSlistGuard {
+    struct curl_slist* list;
+    CurlSlistGuard() : list(nullptr) {}
+    explicit CurlSlistGuard(struct curl_slist* l) : list(l) {}
+    ~CurlSlistGuard() { if (list) curl_slist_free_all(list); }
+    void set(struct curl_slist* l) {
+        if (list) curl_slist_free_all(list);
+        list = l;
+    }
+};
+
 struct ThreadTask {
     std::string url;
     std::string path;
@@ -46,6 +57,8 @@ struct ThreadTask {
     int fd;
     curl_off_t max_speed;
     const char* user_agent;
+    const char* headers_str;
+    const char* proxy;
 };
 
 static std::mutex state_mutex;
@@ -128,6 +141,27 @@ static void download_range(ThreadTask* task) {
     if (task->user_agent && *task->user_agent) {
         curl_easy_setopt(curl_guard.curl, CURLOPT_USERAGENT, task->user_agent);
     }
+    if (task->proxy && *task->proxy) {
+        curl_easy_setopt(curl_guard.curl, CURLOPT_PROXY, task->proxy);
+    }
+    CurlSlistGuard hs_guard;
+    if (task->headers_str && *task->headers_str) {
+        struct curl_slist* list = nullptr;
+        std::string h_str(task->headers_str);
+        size_t pos = 0;
+        while ((pos = h_str.find('\n')) != std::string::npos) {
+            std::string line = h_str.substr(0, pos);
+            if (!line.empty()) {
+                list = curl_slist_append(list, line.c_str());
+            }
+            h_str.erase(0, pos + 1);
+        }
+        if (!h_str.empty()) {
+            list = curl_slist_append(list, h_str.c_str());
+        }
+        hs_guard.set(list);
+        curl_easy_setopt(curl_guard.curl, CURLOPT_HTTPHEADER, hs_guard.list);
+    }
     CURLcode res = curl_easy_perform(curl_guard.curl);
     if (res == CURLE_OK) {
         task->success = true;
@@ -136,7 +170,7 @@ static void download_range(ThreadTask* task) {
 
 extern "C" {
     int download_http_cpp(
-        const char* url,
+        const char* url_newline_separated,
         const char* output_path,
         int connections,
         bool quiet,
@@ -144,23 +178,62 @@ extern "C" {
         void* user_data,
         curl_off_t max_speed,
         const char* user_agent,
-        bool resume
+        bool resume,
+        const char* headers_newline_separated,
+        const char* proxy
     ) {
         (void)quiet;
         static std::once_flag curl_init_flag;
         std::call_once(curl_init_flag, []() { curl_global_init(CURL_GLOBAL_ALL); });
+        std::vector<std::string> urls;
+        std::string u_str(url_newline_separated);
+        size_t upos = 0;
+        while ((upos = u_str.find('\n')) != std::string::npos) {
+            std::string line = u_str.substr(0, upos);
+            if (!line.empty()) {
+                urls.push_back(line);
+            }
+            u_str.erase(0, upos + 1);
+        }
+        if (!u_str.empty()) {
+            urls.push_back(u_str);
+        }
+        if (urls.empty()) {
+            return -9;
+        }
         CurlHandleGuard head_curl;
         if (!head_curl.curl) {
             return -1;
         }
         HeaderData hd = { false };
-        curl_easy_setopt(head_curl.curl, CURLOPT_URL, url);
+        curl_easy_setopt(head_curl.curl, CURLOPT_URL, urls[0].c_str());
         curl_easy_setopt(head_curl.curl, CURLOPT_NOBODY, 1L);
         curl_easy_setopt(head_curl.curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(head_curl.curl, CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(head_curl.curl, CURLOPT_HEADERDATA, &hd);
         if (user_agent && *user_agent) {
             curl_easy_setopt(head_curl.curl, CURLOPT_USERAGENT, user_agent);
+        }
+        if (proxy && *proxy) {
+            curl_easy_setopt(head_curl.curl, CURLOPT_PROXY, proxy);
+        }
+        CurlSlistGuard head_hs_guard;
+        if (headers_newline_separated && *headers_newline_separated) {
+            struct curl_slist* list = nullptr;
+            std::string h_str(headers_newline_separated);
+            size_t pos = 0;
+            while ((pos = h_str.find('\n')) != std::string::npos) {
+                std::string line = h_str.substr(0, pos);
+                if (!line.empty()) {
+                    list = curl_slist_append(list, line.c_str());
+                }
+                h_str.erase(0, pos + 1);
+            }
+            if (!h_str.empty()) {
+                list = curl_slist_append(list, h_str.c_str());
+            }
+            head_hs_guard.set(list);
+            curl_easy_setopt(head_curl.curl, CURLOPT_HTTPHEADER, head_hs_guard.list);
         }
         CURLcode res = curl_easy_perform(head_curl.curl);
         if (res != CURLE_OK) {
@@ -212,7 +285,7 @@ extern "C" {
             FileDescriptorGuard sfd_guard(raw_sfd);
             std::atomic<curl_off_t> single_progress(resume_from);
             ThreadTask task;
-            task.url = url;
+            task.url = urls[0];
             task.path = output_path;
             task.start = 0;
             task.end = total_size - 1;
@@ -226,7 +299,9 @@ extern "C" {
             task.fd = sfd_guard.fd;
             task.max_speed = max_speed;
             task.user_agent = user_agent;
-            curl_easy_setopt(single_curl.curl, CURLOPT_URL, url);
+            task.headers_str = headers_newline_separated;
+            task.proxy = proxy;
+            curl_easy_setopt(single_curl.curl, CURLOPT_URL, urls[0].c_str());
             curl_easy_setopt(single_curl.curl, CURLOPT_WRITEFUNCTION, write_callback);
             curl_easy_setopt(single_curl.curl, CURLOPT_WRITEDATA, &task);
             curl_easy_setopt(single_curl.curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -240,6 +315,27 @@ extern "C" {
             }
             if (user_agent && *user_agent) {
                 curl_easy_setopt(single_curl.curl, CURLOPT_USERAGENT, user_agent);
+            }
+            if (proxy && *proxy) {
+                curl_easy_setopt(single_curl.curl, CURLOPT_PROXY, proxy);
+            }
+            CurlSlistGuard single_hs_guard;
+            if (headers_newline_separated && *headers_newline_separated) {
+                struct curl_slist* list = nullptr;
+                std::string h_str(headers_newline_separated);
+                size_t pos = 0;
+                while ((pos = h_str.find('\n')) != std::string::npos) {
+                    std::string line = h_str.substr(0, pos);
+                    if (!line.empty()) {
+                        list = curl_slist_append(list, line.c_str());
+                    }
+                    h_str.erase(0, pos + 1);
+                }
+                if (!h_str.empty()) {
+                    list = curl_slist_append(list, h_str.c_str());
+                }
+                single_hs_guard.set(list);
+                curl_easy_setopt(single_curl.curl, CURLOPT_HTTPHEADER, single_hs_guard.list);
             }
             CURLcode sres = curl_easy_perform(single_curl.curl);
             return (sres == CURLE_OK) ? 0 : -7;
@@ -265,7 +361,7 @@ extern "C" {
         curl_off_t chunk_size = total_size / connections;
         std::vector<ThreadTask> tasks(connections);
         for (int i = 0; i < connections; ++i) {
-            tasks[i].url = url;
+            tasks[i].url = urls[i % urls.size()];
             tasks[i].path = output_path;
             if (state_loaded) {
                 tasks[i].start = segments[i].start;
@@ -283,6 +379,8 @@ extern "C" {
             tasks[i].total_size = total_size;
             tasks[i].max_speed = (max_speed > 0) ? (max_speed / connections) : 0;
             tasks[i].user_agent = user_agent;
+            tasks[i].headers_str = headers_newline_separated;
+            tasks[i].proxy = proxy;
         }
         if (!state_loaded) {
             save_state(state_path, total_size, tasks);
