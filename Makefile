@@ -9,6 +9,9 @@ SRC_CXX = src/torrent_downloader.cpp
 OBJ = $(SRC_C:.c=.o) $(SRC_CXX:.cpp=.o)
 TARGET = rux
 
+PREFIX = /usr/local
+BINDIR = $(PREFIX)/bin
+
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
@@ -22,3 +25,9 @@ $(TARGET): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(TARGET)
+
+install: $(TARGET)
+	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
